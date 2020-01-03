@@ -2,7 +2,6 @@ import boto3
 import logging
 import requests
 import json
-from time import time
 from xml.etree import ElementTree
 import sys
 import yaml
@@ -10,12 +9,11 @@ import argparse
 from cerberus import Validator
 
 class AWSAutoBuild:
-    """docstring for AWSAutoBuild."""
 
     def __init__(self, build_schema):
         # Create internal class variables
         self.config = {}
-        self.logger = logging.getLogger('autobuild_logger')                     # Setup logging resources
+        self.logger = {}                                                        # Setup logging resources
         self.ec2_obj = boto3.resource('ec2')                                    # Create resource objects for boto3
         self.ec2_client = boto3.client('ec2')
         self.cf_client = boto3.client('cloudformation')
@@ -49,8 +47,8 @@ class AWSAutoBuild:
             return
 
     def set_logging(self, base_name):
-
-        self.logger.setLevel(logging.INFO)
+        logger = logging.getLogger('autobuild_logger')
+        logger.setLevel(logging.INFO)
 
         # Create handlers
         c_handler = logging.StreamHandler()
@@ -64,10 +62,10 @@ class AWSAutoBuild:
         f_handler.setFormatter(f_format)
 
         # Add handlers to the logger
-        self.logger.addHandler(c_handler)
-        self.logger.addHandler(f_handler)
+        logger.addHandler(c_handler)
+        logger.addHandler(f_handler)
 
-        return
+        return logger
 
     def set_meraki_headers(self, api_key, content_type):
         # Set Meraki API headers
@@ -116,6 +114,14 @@ class AWSAutoBuild:
         self.logger.info('AWS key pair for '+ base_name +' has been created')
         return
 
+    def del_aws_keypair(self, base_name):
+        self.ec2_client.delete_key_pair(
+            KeyName=base_name+'-key',
+        )
+
+        self.logger.info('AWS key pair for '+ base_name +' has been deleted')
+        return
+
     def set_aws_vpc(self, cidr_block, base_name):
         # Creating VPC
         vpc = self.ec2_obj.create_vpc(CidrBlock=cidr_block)
@@ -128,17 +134,74 @@ class AWSAutoBuild:
         self.logger.info('VPC '+ vpc_name +' has been created')
         return vpc
 
-    def set_aws_inet_gw(self, vpc):
+    def del_aws_vpc(self, base_name):
+        vpc = self.ec2_client.describe_vpcs(
+            Filters = [
+                { 'Name': 'tag:Name', 'Values': [base_name+'-vpc']}
+            ]
+        )
+        vpc_id = vpc['Vpcs'][0]['VpcId']
+
+        self.ec2_client.delete_vpc(
+            VpcId=vpc_id,
+        )
+
+        self.logger.info('AWS VPC '+ vpc_id +' has been deleted')
+        return
+
+    def set_aws_inet_gw(self, vpc, base_name):
         # Creating an internet gateway and attach it to VPC
         igw = self.ec2_obj.create_internet_gateway()
+        igw_name = base_name+'-igw'
+        igw.create_tags(Tags=[{"Key": "Name", "Value": igw_name}])
         vpc.attach_internet_gateway(InternetGatewayId=igw.id)
 
         self.logger.info('Internet gateway has been created and attached')
         return igw
 
-    def set_aws_default_route(self, vpc, igw):
+    def del_aws_inet_gw(self, base_name):
+        igw = self.ec2_client.describe_internet_gateways(
+            Filters = [
+                { 'Name': 'tag:Name', 'Values': [base_name+'-igw']}
+            ]
+        )
+        igw_id = igw['InternetGateways'][0]['InternetGatewayId']
+        if igw['InternetGateways'][0]['Attachments'] == []:
+            self.ec2_client.delete_internet_gateway(
+                InternetGatewayId=igw_id,
+            )
+            self.logger.info('Internet gateway ' +igw_id+ ' has been deleted')
+            return
+        else:
+            igw_vpc_state = igw['InternetGateways'][0]['Attachments'][0]['State']
+            vpc_id = igw['InternetGateways'][0]['Attachments'][0]['VpcId']
+            igw_attach = igw['InternetGateways'][0]['Attachments']
+
+            self.ec2_client.detach_internet_gateway(
+                InternetGatewayId=igw_id,
+                VpcId=vpc_id
+            )
+
+            while igw_attach != []:
+                igw = self.ec2_client.describe_internet_gateways(
+                    Filters = [
+                        { 'Name': 'tag:Name', 'Values': [base_name+'-igw']}
+                    ]
+                )
+                igw_attach = igw['InternetGateways'][0]['Attachments']
+                if igw_vpc_state == []:
+                    self.logger.info('Internet gateway ' +igw_id+ ' is now detached from VPC '+vpc_id)
+
+            self.ec2_client.delete_internet_gateway(
+                InternetGatewayId=igw_id,
+            )
+            self.logger.info('Internet gateway ' +igw_id+ ' has been deleted')
+            return
+
+    def set_aws_default_route(self, vpc, igw, base_name):
         # Creating a route table and a default route
         routetable = vpc.create_route_table()
+        routetable.create_tags(Tags=[{"Key": "Name", "Value": base_name+'-rtbl'}])
 
         route = routetable.create_route(
             DestinationCidrBlock='0.0.0.0/0',
@@ -147,26 +210,69 @@ class AWSAutoBuild:
         self.logger.info('Route table and default route has been created')
         return routetable
 
-    def set_aws_subnet(self, vpc, aws_zone, aws_subnet, aws_routetable):
+    def del_aws_route_table(self, base_name):
+        route_table = self.ec2_client.describe_route_tables(
+            Filters = [
+                { 'Name': 'tag:Name', 'Values': [base_name+'-rtbl']}
+            ]
+        )
+        rt_table_id = route_table['RouteTables'][0]['RouteTableId']
+
+        self.ec2_client.delete_route_table(
+            RouteTableId=rt_table_id,
+        )
+        self.logger.info('Route table ' +rt_table_id+ ' has been deleted')
+        return
+
+    def set_aws_subnet(self, vpc, aws_zone, aws_subnet, aws_routetable, base_name):
         # Creating subnet and associate it with route table
         subnet = self.ec2_obj.create_subnet(
             AvailabilityZone=aws_zone,
             CidrBlock=aws_subnet,
             VpcId=vpc.id
             )
+        subnet.create_tags(Tags=[{"Key": "Name", "Value": base_name+'-subnet'}])
         aws_routetable.associate_with_subnet(SubnetId=subnet.id)
 
         self.logger.info('Subnet '+ aws_subnet +' created and associated with route table')
         return subnet
 
+    def del_aws_subnet(self, base_name):
+        subnet = self.ec2_client.describe_subnets(
+            Filters = [
+                { 'Name': 'tag:Name', 'Values': [base_name+'-subnet']}
+            ]
+        )
+        subnet_id = subnet['Subnets'][0]['SubnetId']
+
+        self.ec2_client.delete_subnet(
+            SubnetId=subnet_id,
+        )
+        self.logger.info('Subnet ' +subnet_id+ ' has been deleted')
+        return
+
+    def del_aws_net_acl(self, base_name):
+        sec_group = self.ec2_client.describe_security_groups(
+            Filters = [
+                { 'Name': 'tag:Name', 'Values': [base_name+'-sec-group']}
+            ]
+        )
+        sec_group_id = sec_group['SecurityGroups'][0]['GroupId']
+
+        self.ec2_client.delete_security_group(
+            GroupId=sec_group_id,
+        )
+        self.logger.info('Security group ' +sec_group_id+ ' has been deleted')
+        return
+
     def set_aws_sec_group(self, base_name, aws_sec_group_descr, vpc, aws_sec_group_protocol, aws_sec_from_port, aws_sec_to_port):
         # Creating a security group and allow traffic inbound rule through the VPC
-        aws_sec_group_name = base_name+'-sec-group'
         securitygroup = self.ec2_obj.create_security_group(
-            GroupName=aws_sec_group_name,
+            GroupName=base_name,
             Description=aws_sec_group_descr,
             VpcId=vpc.id)
-        self.logger.info('Security group '+ aws_sec_group_name +' has been created')
+        securitygroup.create_tags(Tags=[{"Key": "Name", "Value": base_name+'-sec-group'}])
+        self.logger.info('Security group '+ securitygroup.id +' has been created')
 
         securitygroup.authorize_ingress(
             CidrIp='0.0.0.0/0',
@@ -179,6 +285,20 @@ class AWSAutoBuild:
         else:
             self.logger.info('Ingress rule has been applied to the security group for ports %d to %d' % (AWS_SEC_FROM_PORT, AWS_SEC_TO_PORT))
         return securitygroup
+
+    def del_aws_sec_group(self, base_name):
+        sec_group = self.ec2_client.describe_security_groups(
+            Filters = [
+                { 'Name': 'tag:Name', 'Values': [base_name+'-sec-group']}
+            ]
+        )
+        sec_group_id = sec_group['SecurityGroups'][0]['GroupId']
+
+        self.ec2_client.delete_security_group(
+            GroupId=sec_group_id,
+        )
+        self.logger.info('Security group ' +sec_group_id+ ' has been deleted')
+        return
 
     def set_aws_vpn_gw(self, aws_vpn_gw_type, aws_bgp_asn, dry_run_flag, base_name, vpc):
         # Creating an virtual private gateway and attach it to VPC
@@ -211,7 +331,7 @@ class AWSAutoBuild:
             VpnGatewayId=vpgw_id,
             DryRun=dry_run_flag
         )
-        self.logger.info('Virtual private gateway is being attached to '+ base_name +'-vpc , please wait .... ')
+        self.logger.info('Virtual private gateway '+ vpgw_name +' is being attached to '+ base_name +'-vpc , please wait .... ')
 
         # Wait for the virtual private gateway to be attached to VPC before continuing
         vpgw_vpc_state = 'detached'
@@ -220,7 +340,6 @@ class AWSAutoBuild:
                 VpnGatewayIds=[
                     vpgw_id,
                 ],
-                DryRun=dry_run_flag
             )
             if vpgw_detail['VpnGateways'][0]['VpcAttachments'][0]['State'] == 'attached':
                 vpgw_vpc_state = 'attached'
@@ -228,6 +347,37 @@ class AWSAutoBuild:
         self.logger.info('Virtual private gateway ' +vpgw_id+ ' is now attached to VPC '+vpc.id)
 
         return vpgw_id
+
+    def del_aws_vpn_gw(self, base_name):
+        vpgw = self.ec2_client.describe_vpn_gateways(
+            Filters = [
+                { 'Name': 'tag:Name', 'Values': [base_name+'-vpgw']}
+            ]
+        )
+        vpgw_id = vpgw['VpnGateways'][0]['VpnGatewayId']
+        vpgw_vpc_state = vpgw['VpnGateways'][0]['VpcAttachments'][0]['State']
+        vpc_id = vpgw['VpnGateways'][0]['VpcAttachments'][0]['VpcId']
+
+        self.ec2_client.detach_vpn_gateway(
+            VpcId=vpc_id,
+            VpnGatewayId=vpgw_id,
+        )
+
+        while vpgw_vpc_state != 'detached':
+            vpgw_detail = self.ec2_client.describe_vpn_gateways(
+                VpnGatewayIds=[
+                    vpgw_id,
+                ],
+            )
+            vpgw_vpc_state = vpgw_detail['VpnGateways'][0]['VpcAttachments'][0]['State']
+            if vpgw_vpc_state == 'detached':
+                self.logger.info('Virtual private gateway ' +vpgw_id+ ' is now detached from VPC '+vpc_id)
+
+        self.ec2_client.delete_vpn_gateway(
+            VpnGatewayId=vpgw_id,
+        )
+        self.logger.info('Virtual private gateway ' +vpgw_id+ ' has been deleted')
+        return
 
     def set_aws_route_propagation(self, aws_vpn_gw_id, aws_routetable):
         # Enable route propagation for virtual gateway
@@ -265,7 +415,21 @@ class AWSAutoBuild:
         self.logger.info('Customer gateway ' +cgw_id+ ' has been set up')
         return cgw_id
 
-    def set_aws_vpn_connection(self, aws_cust_gw_id, tunnel_type, aws_vpn_gw_id, dry_run_flag, aws_static_routes_only_flag):
+    def del_aws_customer_gw(self, base_name):
+        cgw = self.ec2_client.describe_customer_gateways(
+            Filters = [
+                { 'Name': 'tag:Name', 'Values': [base_name+'-cgw']}
+            ]
+        )
+        cgw_id = cgw['CustomerGateways'][0]['CustomerGatewayId']
+
+        self.ec2_client.delete_customer_gateway(
+            CustomerGatewayId=cgw_id,
+        )
+        self.logger.info('Customer gateway ' +cgw_id+ ' has been deleted')
+        return
+
+    def set_aws_vpn_connection(self, aws_cust_gw_id, tunnel_type, aws_vpn_gw_id, dry_run_flag, aws_static_routes_only_flag, base_name):
         # Creating VPN connection
         vpn = self.ec2_client.create_vpn_connection(
             CustomerGatewayId=aws_cust_gw_id,
@@ -277,6 +441,19 @@ class AWSAutoBuild:
             }
         )
         vpn_id = vpn['VpnConnection']['VpnConnectionId']
+
+        self.ec2_client.create_tags(
+            Resources=[
+                vpn_id,
+            ],
+            Tags=[
+                {
+                    'Key': 'Name',
+                    'Value': base_name+'-vpn',
+                },
+            ],
+        )
+
         self.logger.info('VPN connection ' +vpn_id+ ' has been built, waiting for availability ...')
 
         # Adding a monitor to wait for the VPN connection to become available
@@ -297,14 +474,38 @@ class AWSAutoBuild:
         vpn_details = vpn["VpnConnection"]["CustomerGatewayConfiguration"]
         xml_tree_root = ElementTree.fromstring(vpn_details)
 
-        stamp = int(time())
-        vpn_details_file_name = 'VPN_connection_details_'+str(stamp)+'.xml'
+        vpn_details_file_name = 'VPN_details_'+vpn_id+'.xml'
         tree = ElementTree.ElementTree()
         setting_root = tree._setroot(xml_tree_root)
         tree.write(vpn_details_file_name, encoding='utf-8', xml_declaration=True)
         self.logger.info('VPN connection details file created: '+vpn_details_file_name)
 
         return vpn_id, xml_tree_root
+
+    def del_aws_vpn_connection(self, base_name):
+        vpn = self.ec2_client.describe_vpn_connections(
+            Filters = [
+                { 'Name': 'tag:Name', 'Values': [base_name+'-vpn']}
+            ]
+        )
+        vpn_id = vpn['VpnConnections'][0]['VpnConnectionId']
+
+        self.ec2_client.delete_vpn_connection(
+            VpnConnectionId=vpn_id,
+        )
+
+        vpn_waiter = self.ec2_client.get_waiter('vpn_connection_deleted')
+        vpn_waiter.wait(
+            VpnConnectionIds=[
+                vpn_id,
+            ],
+            WaiterConfig={
+                'Delay': 10,
+                'MaxAttempts': 6
+            }
+        )
+        self.logger.info('VPN connection ' +vpn_id+ ' has been deleted')
+        return
 
     def set_aws_remote_subnet_route(self, remote_subnet, aws_vpn_id):
         # Adding a remote site route to the VPN
@@ -325,18 +526,29 @@ class AWSAutoBuild:
         # Configure the Meraki MX as a tunnel endpoint for the VPN via the API
         meraki_api_url = meraki_base_uri + '/organizations/'+ meraki_org_id +'/thirdPartyVPNPeers'
 
-        meraki_tunnel_endpoint_data = [
-          {
+        meraki_vpns_resp = requests.get(meraki_api_url, headers=meraki_api_headers)
+        meraki_3party_vpns = meraki_vpns_resp.json()
+
+        if meraki_vpns_resp.status_code != 200:
+            print(meraki_3party_vpns)
+        else:
+            self.logger.info('Meraki VPN connections have been retrieved')
+
+        meraki_tunnel_endpoint_data = {
             "name": base_name,
             "publicIp": aws_tunnel_out_ip,
             "privateSubnets": [aws_subnet],
             "secret": aws_tunnel_psk,
             "ipsecPoliciesPreset": meraki_ipsec_policy
           }
-        ]
 
+        meraki_3party_vpns.append(meraki_tunnel_endpoint_data)
+
+        peers = {
+            'peers': meraki_3party_vpns
+        }
         meraki_api_resp = requests.put(meraki_api_url, headers=meraki_api_headers,
-                                        data=json.dumps(meraki_tunnel_endpoint_data), verify=False)
+                                        data=json.dumps(peers), verify=False)
         if meraki_api_resp.status_code != 200:
             print(meraki_api_resp.text)
         else:
@@ -400,4 +612,22 @@ class AWSAutoBuild:
         )
 
         self.logger.info('EC2 instance for c9800-cl has been launched as '+ wlc_hostname +' at '+ wlc_mgmt_ip)
+        return
+
+    def del_aws_cform_stack(self, base_name):
+        self.cf_client.delete_stack(
+            StackName=base_name+'-stack',
+        )
+
+        waiter = self.cf_client.get_waiter('stack_delete_complete')
+
+        waiter.wait(
+            StackName=base_name+'-stack',
+            WaiterConfig={
+                'Delay': 10,
+                'MaxAttempts': 60
+            }
+        )
+
+        self.logger.info('Stack '+ base_name +'-stack has been deleted')
         return
